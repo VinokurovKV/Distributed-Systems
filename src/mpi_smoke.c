@@ -6,7 +6,7 @@
 #error "This project requires Open MPI. Select its mpicc wrapper."
 #endif
 
-/* Environment check only. The merging algorithm is not implemented here. */
+// проверяем библиотеку, число процессов и размещение по узлам
 int main(int argc, char **argv)
 {
     MPI_Init(&argc, &argv);
@@ -41,7 +41,7 @@ int main(int argc, char **argv)
 
     if (rank == 0) {
         printf("MPI library: %.*s\n", library_length, library);
-        printf("Environment check only; variant 54 is not implemented yet.\n");
+        printf("Environment check only; run merge for variant 54.\n");
     }
 
     MPI_Finalize();
