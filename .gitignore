@@ -1,0 +1,18 @@
+/ParallelDataProcessing/
+
+# Local build output
+/build/
+*.o
+*.d
+*.dSYM/
+
+# Experiment output
+/results/
+*.out
+*.err
+
+# Local editor and OS files
+.DS_Store
+.idea/
+.vscode/
+*~
