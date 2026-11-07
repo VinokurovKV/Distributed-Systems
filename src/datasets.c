@@ -111,14 +111,22 @@ int dataset_local_valid(const int32_t *local, int n, int rank, Dataset dataset,
     for (int i = 0; i < n; i++) {
         const size_t g = start + (size_t)i;
         // повторная генерация позволяет заметить изменение входа без его копии
-        if (local[i] != dataset_value(dataset, n, rank / 4, g, seed)) {
+        const int32_t expected = dataset_value(dataset, n, rank / 4, g, seed);
+        if (local[i] != expected) {
+            fprintf(stderr, "rank %d: вход[%d], глобальная позиция %zu: "
+                    "ожидалось %" PRId32 ", получено %" PRId32 "\n",
+                    rank, i, g, expected, local[i]);
             return 0;
         }
         if (i > 0 && local[i - 1] > local[i]) {
+            fprintf(stderr, "rank %d: нарушен порядок входа в позициях %d и %d\n",
+                    rank, i - 1, i);
             return 0;
         }
         if (i == 0 && start > 0 &&
             dataset_value(dataset, n, rank / 4, start - 1, seed) > local[i]) {
+            fprintf(stderr, "rank %d: нарушен порядок на левой границе блока\n",
+                    rank);
             return 0;
         }
     }
@@ -132,7 +140,9 @@ int dataset_verify_result(const int32_t *result, int n, Dataset dataset,
     const size_t length = 4 * (size_t)n;
     for (size_t i = 1; i < 2 * length; i++) {
         if (result[i - 1] > result[i]) {
-            fprintf(stderr, "Result is not sorted at position %zu\n", i);
+            fprintf(stderr, "rank 0: порядок результата: result[%zu]=%" PRId32
+                    " > result[%zu]=%" PRId32 "\n", i - 1, result[i - 1],
+                    i, result[i]);
             return 0;
         }
     }
@@ -158,9 +168,10 @@ int dataset_verify_result(const int32_t *result, int n, Dataset dataset,
             // g своих предшественников и low элементов другой последовательности
             const size_t destination = g + low;
             if (result[destination] != value) {
-                fprintf(stderr, "Mismatch at position %zu: expected %" PRId32
-                        ", got %" PRId32 "\n", destination, value,
-                        result[destination]);
+                fprintf(stderr, "rank 0: результат[%zu], последовательность %d, "
+                        "входная позиция %zu: ожидалось %" PRId32
+                        ", получено %" PRId32 "\n", destination, sequence,
+                        g, value, result[destination]);
                 return 0;
             }
         }

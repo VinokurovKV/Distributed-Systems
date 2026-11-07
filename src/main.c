@@ -19,10 +19,32 @@ typedef struct {
 enum {
     DEFAULT_N = 16,     // размер блока при запуске без аргументов
     DEFAULT_SEED = 54,  // начальное значение генератора случайных данных
+    WARMUP_RUNS = 1,    // прогревы перед измерениями
+    MEASURED_RUNS = 7,  // число повторов для медианы и разброса
     MEASUREMENT_DONE_TAG = 200
 };
 
+_Static_assert(WARMUP_RUNS >= 0 && MEASURED_RUNS > 0, "Invalid repeat counts");
+
 #ifndef MERGE_SELF_TEST
+// сохраняем сведения об окружении рядом с результатами измерений
+static void print_environment(int rank, const char *library)
+{
+    char host[MPI_MAX_PROCESSOR_NAME] = {0};
+    char hosts[PROCESS_COUNT][MPI_MAX_PROCESSOR_NAME];
+    int length = 0;
+    MPI_CALL(MPI_Get_processor_name(host, &length));
+    MPI_CALL(MPI_Gather(host, MPI_MAX_PROCESSOR_NAME, MPI_CHAR, hosts,
+                        MPI_MAX_PROCESSOR_NAME, MPI_CHAR, 0, MPI_COMM_WORLD));
+    if (rank == 0) {
+        printf("MPI library: %s\n", library);
+        printf("timer_resolution_seconds=%.9g\n", MPI_Wtick());
+        for (int worker = 0; worker < PROCESS_COUNT; worker++) {
+            printf("rank=%d host=%s\n", worker, hosts[worker]);
+        }
+    }
+}
+
 // краткая справка по обычному запуску
 static void usage(void)
 {
@@ -104,13 +126,21 @@ static int32_t *allocate_elements(size_t count)
 static int verify_order(const MergeStats *stats, Dataset dataset)
 {
     if (stats->owner_count != PROCESS_COUNT - 1) {
+        fprintf(stderr, "rank 0: трасса: ожидалось 7 владельцев, получено %d\n",
+                stats->owner_count);
         return 0;
     }
     unsigned seen = 0;  // по одному биту на владельца
     for (int i = 0; i < stats->owner_count; i++) {
         const int owner = stats->owners[i];
-        if (owner < 1 || owner >= PROCESS_COUNT ||
-            (seen & (1U << (unsigned)owner)) != 0) {
+        if (owner < 1 || owner >= PROCESS_COUNT) {
+            fprintf(stderr, "rank 0: трасса[%d]: недопустимый владелец %d\n",
+                    i, owner);
+            return 0;
+        }
+        if ((seen & (1U << (unsigned)owner)) != 0) {
+            fprintf(stderr, "rank 0: трасса[%d]: повторный запрос владельцу %d\n",
+                    i, owner);
             return 0;
         }
         seen |= 1U << (unsigned)owner;
@@ -129,10 +159,60 @@ static int verify_order(const MergeStats *stats, Dataset dataset)
     }
     for (int i = 0; expected != NULL && i < stats->owner_count; i++) {
         if (stats->owners[i] != expected[i]) {
+            fprintf(stderr, "rank 0: трасса[%d]: ожидался владелец %d, получен %d\n",
+                    i, expected[i], stats->owners[i]);
             return 0;
         }
     }
     return 1;
+}
+
+// отдельно проверяем каждый счётчик, чтобы указать причину расхождения
+static int verify_totals(const uint64_t totals[3], int n)
+{
+    const uint64_t expected[] = {7, 7, 7 * (uint64_t)n};
+    const char *names[] = {"запросы", "блоки", "элементы"};
+    int valid = 1;
+    for (int i = 0; i < 3; i++) {
+        if (totals[i] != expected[i]) {
+            fprintf(stderr, "rank 0: счётчик %s: ожидалось %" PRIu64
+                    ", получено %" PRIu64 "\n", names[i], expected[i], totals[i]);
+            valid = 0;
+        }
+    }
+    return valid;
+}
+
+// не даём ранним владельцам начать проверку до готовности результата
+static void finish_measurement(int rank)
+{
+    if (rank == 0) {
+        for (int worker = 1; worker < PROCESS_COUNT; worker++) {
+            MPI_CALL(MPI_Ssend(NULL, 0, MPI_BYTE, worker, MEASUREMENT_DONE_TAG,
+                               MPI_COMM_WORLD));
+        }
+    } else {
+        MPI_CALL(MPI_Recv(NULL, 0, MPI_BYTE, 0, MEASUREMENT_DONE_TAG,
+                          MPI_COMM_WORLD, MPI_STATUS_IGNORE));
+    }
+}
+
+// сортируем только небольшую таблицу длительностей
+static void print_timings(double *samples, int count)
+{
+    for (int i = 1; i < count; i++) {
+        const double value = samples[i];
+        int j = i;
+        while (j > 0 && samples[j - 1] > value) {
+            samples[j] = samples[j - 1];
+            j--;
+        }
+        samples[j] = value;
+    }
+    const double middle = samples[(count - 1) / 2];
+    const double median = middle + (samples[count / 2] - middle) / 2;
+    printf("wall_min_seconds=%.9f wall_median_seconds=%.9f wall_max_seconds=%.9f\n",
+           samples[0], median, samples[count - 1]);
 }
 
 // выводим модельные времена обменов, не время реальной сети
@@ -152,7 +232,7 @@ static void print_trace(const MergeStats *stats, int n)
 }
 
 // готовим один случай, измеряем слияние и проверяем результат
-static int run_case(const Options *options, int rank, int quiet)
+static int run_case(const Options *options, int rank, int test_mode)
 {
     const int n = options->n;
     int32_t *local = allocate_elements((size_t)n);
@@ -162,6 +242,9 @@ static int run_case(const Options *options, int rank, int quiet)
         // итог 8n и два буфера по n выделяются только корню
         result = allocate_elements(8 * (size_t)n);
         buffers = allocate_elements(2 * (size_t)n);
+        // первое обращение к страницам памяти не должно попасть в измерение
+        memset(result, 0, 8 * (size_t)n * sizeof(*result));
+        memset(buffers, 0, 2 * (size_t)n * sizeof(*buffers));
     }
     dataset_fill(local, n, rank, options->dataset, options->seed);
 
@@ -173,60 +256,77 @@ static int run_case(const Options *options, int rank, int quiet)
         protocol_fail("Generated inputs are not globally sorted");
     }
 
-    // измеряем только слияние
-    MPI_CALL(MPI_Barrier(MPI_COMM_WORLD));
-    const double start = MPI_Wtime();
+    const int warmups = test_mode ? 0 : WARMUP_RUNS;
+    const int repetitions = test_mode ? 1 : MEASURED_RUNS;
+    double samples[MEASURED_RUNS];
+    int sample_count = 0;
     MergeStats stats;
-    merge_blocks(local, n, rank, result, buffers,
-                 rank == 0 ? buffers + n : NULL, &stats);
-    const double elapsed = MPI_Wtime() - start;
-
-    // проверка начинается после готовности результата и остановки таймера
-    if (rank == 0) {
-        for (int worker = 1; worker < PROCESS_COUNT; worker++) {
-            MPI_CALL(MPI_Ssend(NULL, 0, MPI_BYTE, worker, MEASUREMENT_DONE_TAG,
-                               MPI_COMM_WORLD));
-        }
-    } else {
-        MPI_CALL(MPI_Recv(NULL, 0, MPI_BYTE, 0, MEASUREMENT_DONE_TAG,
-                          MPI_COMM_WORLD, MPI_STATUS_IGNORE));
-    }
-
-    // итоговое реальное время берём по самому медленному процессу
-    double maximum = 0;
-    MPI_CALL(MPI_Reduce(&elapsed, &maximum, 1, MPI_DOUBLE, MPI_MAX, 0,
-                        MPI_COMM_WORLD));
-    // суммируем только отправки, чтобы не считать одно сообщение дважды
-    const uint64_t sent[] = {stats.requests, stats.blocks, stats.elements};
     uint64_t totals[3] = {0};
-    MPI_CALL(MPI_Reduce(sent, totals, 3, MPI_UINT64_T, MPI_SUM, 0, MPI_COMM_WORLD));
-
-    // каждый владелец проверяет сохранность своего исходного блока
-    valid = dataset_local_valid(local, n, rank, options->dataset, options->seed);
-    if (rank == 0) {
-        valid = valid && dataset_verify_result(result, n, options->dataset,
-                                               options->seed);
-        // сверяем фактические обмены с расчётом протокола
-        valid = valid && totals[0] == 7 && totals[1] == 7 &&
-                totals[2] == 7 * (uint64_t)n && verify_order(&stats, options->dataset);
+    if (rank == 0 && !test_mode) {
+        printf("case=%s n=%d seed=%" PRIu64 " warmups=%d repetitions=%d\n",
+               dataset_name(options->dataset), n, options->seed, warmups, repetitions);
     }
-    MPI_CALL(MPI_Allreduce(&valid, &all_valid, 1, MPI_INT, MPI_MIN, MPI_COMM_WORLD));
+    for (int run = 0; run < warmups + repetitions; run++) {
+        // измеряем только слияние, все массивы уже выделены и прогреты
+        MPI_CALL(MPI_Barrier(MPI_COMM_WORLD));
+        const double start = MPI_Wtime();
+        merge_blocks(local, n, rank, result, buffers,
+                     rank == 0 ? buffers + n : NULL, &stats);
+        const double elapsed = MPI_Wtime() - start;
+        finish_measurement(rank);
 
-    if (rank == 0) {
-        if (!quiet || !all_valid) {
+        // берём максимум по процессам отдельно для каждого повтора
+        double maximum = 0;
+        MPI_CALL(MPI_Reduce(&elapsed, &maximum, 1, MPI_DOUBLE, MPI_MAX, 0,
+                            MPI_COMM_WORLD));
+        const uint64_t sent[] = {stats.requests, stats.blocks, stats.elements};
+        MPI_CALL(MPI_Reduce(sent, totals, 3, MPI_UINT64_T, MPI_SUM, 0, MPI_COMM_WORLD));
+
+        valid = dataset_local_valid(local, n, rank, options->dataset, options->seed);
+        if (!valid) {
+            fprintf(stderr, "rank %d: сохранность входа нарушена после запуска %d\n",
+                    rank, run + 1);
+        }
+        if (rank == 0) {
+            // выполняем все проверки, даже если одна из них уже нашла ошибку
+            const int result_valid = dataset_verify_result(result, n, options->dataset,
+                                                            options->seed);
+            const int counts_valid = verify_totals(totals, n);
+            const int order_valid = verify_order(&stats, options->dataset);
+            valid = valid && result_valid && counts_valid && order_valid;
+        }
+        MPI_CALL(MPI_Allreduce(&valid, &all_valid, 1, MPI_INT, MPI_MIN, MPI_COMM_WORLD));
+        if (!all_valid) {
+            if (rank == 0) {
+                fprintf(stderr, "case=%s n=%d run=%d verification=FAIL\n",
+                        dataset_name(options->dataset), n, run + 1);
+            }
+            break;
+        }
+        if (rank == 0 && run >= warmups) {
+            samples[sample_count++] = maximum;
+            if (!test_mode) {
+                printf("sample=%d wall_max_seconds=%.9f verification=PASS\n",
+                       sample_count, maximum);
+            }
+        }
+    }
+
+    if (rank == 0 && all_valid) {
+        if (!test_mode) {
             const uint64_t messages = totals[0] + totals[1];
             const uint64_t bytes = 4 * totals[2];
-            printf("case=%s n=%d seed=%" PRIu64 " verification=%s\n",
-                   dataset_name(options->dataset), n, options->seed,
-                   all_valid ? "PASS" : "FAIL");
-            printf("requests=%" PRIu64 " blocks=%" PRIu64 " messages=%" PRIu64
+            printf("verification=PASS\n");
+            printf("statistics_scope=per_merge requests=%" PRIu64
+                   " blocks=%" PRIu64 " messages=%" PRIu64
                    " data_bytes=%" PRIu64 " model_time=%" PRIu64 "\n",
                    totals[0], totals[1], messages, bytes, 100 * messages + bytes);
-            printf("wall_max_seconds=%.9f extra_elements_root=%" PRIu64 "\n",
-                   maximum, 2 * (uint64_t)n);
-            printf("harness_done_messages=7 (outside merge interval)\n");
+            printf("extra_elements_root=%" PRIu64 "\n", 2 * (uint64_t)n);
+            printf("harness_done_messages=7 (per run, outside merge interval)\n");
+            print_timings(samples, sample_count);
         }
         if (options->trace) {
+            printf("trace_scope=last_merge\n");
             print_trace(&stats, n);
         }
     }
@@ -322,6 +422,7 @@ int main(int argc, char **argv)
 #ifdef MERGE_SELF_TEST
     const int valid = self_test(&options, rank);
 #else
+    print_environment(rank, library);
     const int valid = run_case(&options, rank, 0);
 #endif
     MPI_CALL(MPI_Finalize());

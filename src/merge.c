@@ -2,6 +2,8 @@
 #include "mpi_helpers.h"
 
 #include <stddef.h>
+#include <stdio.h>
+#include <string.h>
 
 // текущее положение в одной распределённой последовательности
 typedef struct {
@@ -12,40 +14,41 @@ typedef struct {
     int32_t *buffer;
 } Stream;
 
-// загружаем блок, только если предыдущий уже использован
-static void ensure_block(Stream *stream, int n, MergeStats *stats)
+// запрашиваем блок в буфер или сразу в его окончательное место
+static void request_block(int owner, int n, int32_t *destination, MergeStats *stats)
 {
-    if (stream->owner == stream->end_owner || stream->current != NULL) {
-        return;
+    if (stats->owner_count >= PROCESS_COUNT - 1) {
+        protocol_fail("Число запросов превысило семь");
     }
 
     // владельцу достаточно пустого запроса, размер блока известен заранее
-    MPI_CALL(MPI_Ssend(NULL, 0, MPI_BYTE, stream->owner, REQUEST_TAG,
+    MPI_CALL(MPI_Ssend(NULL, 0, MPI_BYTE, owner, REQUEST_TAG,
                        MPI_COMM_WORLD));
     stats->requests++;
 
     MPI_Status status;
-    MPI_CALL(MPI_Recv(stream->buffer, n, MPI_INT32_T, stream->owner, DATA_TAG,
+    MPI_CALL(MPI_Recv(destination, n, MPI_INT32_T, owner, DATA_TAG,
                       MPI_COMM_WORLD, &status));
     // неполный ответ нельзя использовать как готовый блок
     int received = 0;
     MPI_CALL(MPI_Get_count(&status, MPI_INT32_T, &received));
-    if (received != n || stats->owner_count >= PROCESS_COUNT - 1) {
-        protocol_fail("Invalid block response");
+    if (received != n) {
+        fprintf(stderr, "rank 0: DATA от %d: ожидалось %d элементов, получено %d\n",
+                owner, n, received);
+        protocol_fail("Неполный ответ на запрос блока");
     }
-    stats->owners[stats->owner_count++] = stream->owner;
-    stream->current = stream->buffer;
+    stats->owners[stats->owner_count++] = owner;
 }
 
-// сдвигаем позицию только в той последовательности, откуда взяли элемент
-static void advance(Stream *stream, int n)
+// вызывается один раз при исчерпании блока
+static void next_block(Stream *stream, int n, MergeStats *stats)
 {
-    stream->position++;
-    if (stream->position == n) {
-        stream->position = 0;
-        // блок закончился, переходим к следующему владельцу
-        stream->owner++;
-        stream->current = NULL;  // следующий блок ещё не загружен
+    stream->position = 0;
+    stream->owner++;
+    stream->current = NULL;
+    if (stream->owner < stream->end_owner) {
+        request_block(stream->owner, n, stream->buffer, stats);
+        stream->current = stream->buffer;
     }
 }
 
@@ -75,24 +78,40 @@ void merge_blocks(const int32_t *local, int n, int rank, int32_t *result,
     // свой блок уже доступен, первый блок второй последовательности запросим
     Stream a = {0, 4, 0, local, buffer_a};
     Stream b = {4, 8, 0, NULL, buffer_b};
-    const size_t length = (size_t)n * PROCESS_COUNT;
+    size_t out = 0;
+    request_block(b.owner, n, b.buffer, stats);
+    b.current = b.buffer;
 
-    for (size_t out = 0; out < length; out++) {
-        // до сравнения должны быть доступны головы обеих непустых последовательностей
-        ensure_block(&a, n, stats);
-        ensure_block(&b, n, stats);
-
-        Stream *selected;
-        // при равенстве берём элемент первой последовательности
-        if (b.owner == b.end_owner ||
-            (a.owner != a.end_owner &&
-             a.current[a.position] <= b.current[b.position])) {
-            selected = &a;
-        } else {
-            selected = &b;
+    while (a.owner < a.end_owner && b.owner < b.end_owner) {
+        // внутри блока только сравнения и запись, без вызовов загрузки
+        while (a.position < n && b.position < n) {
+            // при равенстве берём элемент первой последовательности
+            if (a.current[a.position] <= b.current[b.position]) {
+                result[out++] = a.current[a.position++];
+            } else {
+                result[out++] = b.current[b.position++];
+            }
         }
-        // записываем одно вхождение, поэтому повторы сохраняются
-        result[out] = selected->current[selected->position];
-        advance(selected, n);
+        if (a.position == n) {
+            next_block(&a, n, stats);
+        } else {
+            next_block(&b, n, stats);
+        }
+    }
+
+    // оставшаяся последовательность уже упорядочена
+    Stream *tail = a.owner < a.end_owner ? &a : &b;
+    const size_t remaining = (size_t)(n - tail->position);
+    memcpy(result + out, tail->current + tail->position,
+           remaining * sizeof(*result));
+    out += remaining;
+
+    // следующие блоки принимаем сразу в итоговый массив
+    for (int owner = tail->owner + 1; owner < tail->end_owner; owner++) {
+        request_block(owner, n, result + out, stats);
+        out += (size_t)n;
+    }
+    if (out != (size_t)n * PROCESS_COUNT) {
+        protocol_fail("Неверное число записанных элементов результата");
     }
 }
